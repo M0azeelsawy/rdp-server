@@ -1,51 +1,40 @@
-name: RDP-Kali
+name: Kali-like GUI over VNC (auto runner, Tailscale-secured)
 
 on:
   workflow_dispatch:
 
 jobs:
-  kali-rdp:
-    name: Kali RDP (self-hosted)
-    runs-on: [self-hosted, linux, kali]
+  gui-vnc-tailscale:
+    runs-on: ubuntu-latest
     timeout-minutes: 360
 
+    env:
+      # keep things consistent
+      DISPLAY_NUM: ":99"
+      VNC_PORT: 5900
+
     steps:
-      - name: Prepare system and install desktop + xrdp
+      - name: Checkout (needed for some runners/logs)
+        uses: actions/checkout@v4
+
+      - name: Install packages (XFCE, Xvfb, x11vnc, tailscale deps)
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           export DEBIAN_FRONTEND=noninteractive
-          # Kali rolling typically uses Debian packaging, install XFCE + xrdp
-          sudo apt-get install -y kali-desktop-xfce xrdp dbus-x11 ufw
+          # lightweight desktop + vnc + common tools
+          sudo apt-get install -y xfce4 xfce4-terminal x11vnc xvfb \
+              xauth dbus-x11 netcat-openbsd curl gnupg lsb-release
 
-          # Configure xfce for xrdp sessions
-          sudo bash -c 'echo xfce4-session > /etc/skel/.xsession'
-
-          sudo systemctl enable --now xrdp
-
-      - name: Create RDP user with secure password
+      - name: Generate VNC password and save to env
+        id: vncpass
         shell: bash
         run: |
-          set -euo pipefail
-          USERNAME=rdp
+          # 16 char password (alnum + symbols) but x11vnc/storepasswd defaults to 8, so we rely on 16 anyway
           PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 16)
-
-          if ! id -u "$USERNAME" >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash "$USERNAME"
-          fi
-
-          echo "$USERNAME:$PASSWORD" | sudo chpasswd
-          sudo usermod -aG sudo,"rdp" "$USERNAME" 2>/dev/null || true
-
-          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
-
-      - name: Allow RDP in firewall (ufw)
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo ufw allow 3389/tcp || true
-          sudo ufw --force enable || true
+          echo "VNC_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
+          echo "VNC_PASSWORD=${PASSWORD}"
 
       - name: Install Tailscale
         shell: bash
@@ -53,62 +42,124 @@ jobs:
           TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -euo pipefail
+          # Install official tailscale package (installer script handles distro)
           curl -fsSL https://tailscale.com/install.sh | sudo sh
 
-      - name: Bring up Tailscale and get IP
+      - name: Start tailscaled and tailscale up
         shell: bash
         env:
           TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          set -euo pipefail
-          HOSTNAME=gh-selfhost-kali-${{ github.run_id }}
-          sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname="$HOSTNAME" || true
-
-          TAILSCALE_IP=""
-          for i in {1..10}; do
-            sleep 3
-            TAILSCALE_IP=$(tailscale ip -4 || true)
-            if [[ -n "$TAILSCALE_IP" ]]; then
+          set -x
+          # Start tailscaled in background with a state file inside /tmp
+          sudo tailscaled --tun=userspace-networking --state=/tmp/tailscaled.state /dev/null &>/tmp/tailscaled.log &
+          TAILSCALED_PID=$!
+          echo "tailscaled pid: $TAILSCALED_PID"
+          # Give it a moment to start
+          sleep 2
+          # Bring up the interface using the auth key
+          sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname="gh-runner-${GITHUB_RUN_ID}" || {
+            echo "tailscale up failed - check /tmp/tailscaled.log"
+            tail -n +1 /tmp/tailscaled.log || true
+            exit 1
+          }
+          # Wait for an IPv4 address
+          for i in {1..12}; do
+            TS_IP=$(tailscale ip -4 || true)
+            if [[ -n "$TS_IP" ]]; then
+              echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+              echo "Found Tailscale IP: $TS_IP"
               break
             fi
+            sleep 2
           done
-
-          if [[ -z "$TAILSCALE_IP" ]]; then
-            echo "Tailscale IP not assigned. Exiting." >&2
+          if [[ -z "${TS_IP:-}" ]]; then
+            echo "No Tailscale IP assigned; tailscale status:"
+            sudo tailscale status || true
             exit 1
           fi
 
-          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
-
-      - name: Verify RDP accessibility via Tailscale
+      - name: Start virtual X display and XFCE session
         shell: bash
         run: |
           set -euo pipefail
+          echo "Starting Xvfb on display $DISPLAY_NUM"
+          # Start virtual X server
+          nohup Xvfb $DISPLAY_NUM -screen 0 1280x720x24 &>/tmp/xvfb.log &
+          XVFB_PID=$!
+          echo "Xvfb pid: $XVFB_PID"
+          export DISPLAY=$DISPLAY_NUM
+
+          # ensure dbus session bus is available for xfce
+          mkdir -p /tmp/xdg-${GITHUB_RUN_ID}
+          export XDG_RUNTIME_DIR=/tmp/xdg-${GITHUB_RUN_ID}
+          sudo chown $USER:$USER $XDG_RUNTIME_DIR || true
+
+          sleep 2
+
+          # Start xfce session in background
+          echo "Starting xfce4-session (headless)"
+          nohup dbus-launch --exit-with-session startxfce4 &>/tmp/xfce.log &
+          XFCE_PID=$!
+          echo "xfce pid: $XFCE_PID"
+          # allow some time for desktop to initialize
+          sleep 5
+
+      - name: Configure x11vnc and start VNC server
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DISPLAY=$DISPLAY_NUM
+          VNC_PASS_FILE=/tmp/vncpass.$GITHUB_RUN_ID
+          # create VNC password file
+          printf "%s\n" "$VNC_PASSWORD" | x11vnc -storepasswd /tmp/vncpass.$GITHUB_RUN_ID >/dev/null
+          chmod 600 $VNC_PASS_FILE || true
+          echo "Starting x11vnc (display $DISPLAY) on port $VNC_PORT, auth file: $VNC_PASS_FILE"
+          # Bind to all interfaces (we rely on Tailscale to secure access). Use -noxdamage to avoid some client issues.
+          nohup x11vnc -display $DISPLAY -rfbauth /tmp/vncpass.$GITHUB_RUN_ID -forever -shared -noxdamage -rfbport $VNC_PORT &>/tmp/x11vnc.log &
+          X11VNC_PID=$!
+          echo "x11vnc pid: $X11VNC_PID"
+          sleep 2
+          tail -n 200 /tmp/x11vnc.log || true
+
+      - name: Verify VNC port reachable from Tailscale IP
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAILSCALE_IP="${TAILSCALE_IP:-}"
           echo "Tailscale IP: $TAILSCALE_IP"
-
-          if timeout 5 bash -c "</dev/tcp/$TAILSCALE_IP/3389" 2>/dev/null; then
-            echo "TCP connectivity to 3389 succeeded"
-          else
-            echo "TCP connectivity to 3389 failed" >&2
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "No Tailscale IP present" >&2
             exit 1
           fi
 
-      - name: Print connection info and keep runner active
+          # simple TCP check using bash /dev/tcp (timeout)
+          if timeout 5 bash -c "cat < /dev/tcp/$TAILSCALE_IP/$VNC_PORT" 2>/dev/null; then
+            echo "Port $VNC_PORT reachable on $TAILSCALE_IP (connection accepted)"
+          else
+            echo "Port $VNC_PORT may not be open yet on $TAILSCALE_IP - verifying processes:"
+            ps aux | egrep 'x11vnc|Xvfb|tailscaled|startxfce' || true
+            tail -n 200 /tmp/x11vnc.log || true
+            exit 1
+          fi
+
+      - name: Print connection info and keep workflow active
         shell: bash
         run: |
           set -euo pipefail
-          echo "\n=== RDP ACCESS (Kali) ==="
-          echo "Address: $TAILSCALE_IP"
-          echo "Username: rdp"
-          echo "Password: $(echo $RDP_CREDS | sed 's/^.*Password: //')"
-          echo "===========================\n"
-
+          echo ""
+          echo "=== GUI ACCESS (VNC over Tailscale) ==="
+          echo "Address (Tailscale IP): ${TAILSCALE_IP}"
+          echo "VNC port: ${VNC_PORT}"
+          echo "VNC password: ${VNC_PASSWORD}"
+          echo ""
+          echo "Use a VNC client (e.g. TigerVNC, RealVNC) to connect to:"
+          echo "  ${TAILSCALE_IP}:${VNC_PORT}"
+          echo ""
+          echo "Notes: The runner will terminate when the job finishes or its timeout is reached."
+          echo "========================================"
+          # Keep job alive (still bound by workflow timeout)
           while true; do
-            echo "[$(date --rfc-3339=seconds)] RDP Active - cancel workflow to terminate"
+            echo "[$(date --rfc-3339=seconds)] VNC session active; cancel workflow to terminate"
             sleep 300
           done
-
-# Notes:
-# - Requires a self-hosted Kali Linux runner with systemd and GUI support.
-# - Uses the TAILSCALE_AUTH_KEY secret for private network access.
-# - This configuration is temporary and intended for secure, limited-duration sessions.
