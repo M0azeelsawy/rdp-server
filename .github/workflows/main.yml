@@ -1,113 +1,239 @@
-name: RDP
+# GitHub Actions workflow providing two variants for Linux RDP access.
+# IMPORTANT: These jobs are written for *self-hosted* Linux machines that
+# support systemd and a GUI (desktop environment). GitHub-hosted runners
+# (containers or ephemeral VMs) generally do NOT support running a full
+# desktop + systemd persistently. Use a self-hosted runner with the label
+# `debian` or `kali` as appropriate.
+
+name: RDP-Linux
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+  debian-rdp:
+    name: Debian RDP (self-hosted)
+    runs-on: [self-hosted, linux, debian]
+    timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Prepare system and install desktop + xrdp
+        shell: bash
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          set -euo pipefail
+          sudo apt-get update
+          export DEBIAN_FRONTEND=noninteractive
+          # Install XFCE and xrdp (adjust packages if you prefer another DE)
+          sudo apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 ufw
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          # Configure xfce for xrdp sessions
+          sudo bash -c 'echo xfce4-session > /etc/skel/.xsession'
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
+          # Enable and start xrdp
+          sudo systemctl enable --now xrdp
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP user with secure password
+        shell: bash
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          set -euo pipefail
+          USERNAME=rdp
+          # Generate a 16-character password (alphanumeric + symbols)
+          PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 16)
+
+          # Create user if it doesn't exist
+          if ! id -u "$USERNAME" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$USERNAME"
+          fi
+
+          echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          # Give sudo and add to necessary groups
+          sudo usermod -aG sudo,"rdp" "$USERNAME" 2>/dev/null || true
+
+          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
+
+      - name: Allow RDP in firewall (ufw)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Allow only from tailscale interface will be configured later; for now allow 3389
+          sudo ufw allow 3389/tcp || true
+          sudo ufw --force enable || true
 
       - name: Install Tailscale
+        shell: bash
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          set -euo pipefail
+          # Use the official Tailscale installer script (works on Debian-family systems)
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
 
-      - name: Establish Tailscale Connection
+      - name: Bring up Tailscale and get IP
+        shell: bash
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          set -euo pipefail
+          HOSTNAME=gh-selfhost-debian-${{ github.run_id }}
+          sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname="$HOSTNAME" || true
 
-      - name: Maintain Connection
+          # Wait for an IPv4 tailscale address
+          TAILSCALE_IP=""
+          for i in {1..10}; do
+            sleep 3
+            TAILSCALE_IP=$(tailscale ip -4 || true)
+            if [[ -n "$TAILSCALE_IP" ]]; then
+              break
+            fi
+          done
+
+          if [[ -z "$TAILSCALE_IP" ]]; then
+            echo "Tailscale IP not assigned. Exiting." >&2
+            exit 1
+          fi
+
+          # Save to environment for later steps
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+
+      - name: Verify RDP accessibility via Tailscale
+        shell: bash
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          set -euo pipefail
+          echo "Tailscale IP: $TAILSCALE_IP"
+
+          # Quick TCP test using bash /dev/tcp (no extra tools required)
+          if timeout 5 bash -c "</dev/tcp/$TAILSCALE_IP/3389" 2>/dev/null; then
+            echo "TCP connectivity to 3389 succeeded"
+          else
+            echo "TCP connectivity to 3389 failed" >&2
+            exit 1
+          fi
+
+      - name: Print connection info and keep runner active
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "\n=== RDP ACCESS (Debian) ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: rdp"
+          echo "Password: $(echo $RDP_CREDS | sed 's/^.*Password: //')"
+          echo "===========================\n"
+
+          # Keep job alive (will still be capped by workflow timeout)
+          while true; do
+            echo "[$(date --rfc-3339=seconds)] RDP Active - cancel workflow to terminate"
+            sleep 300
+          done
+
+  kali-rdp:
+    name: Kali RDP (self-hosted)
+    runs-on: [self-hosted, linux, kali]
+    timeout-minutes: 360
+
+    steps:
+      - name: Prepare system and install desktop + xrdp
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          export DEBIAN_FRONTEND=noninteractive
+          # Kali rolling typically uses Debian packaging, install XFCE + xrdp
+          sudo apt-get install -y kali-desktop-xfce xrdp dbus-x11 ufw
+
+          # Configure xfce for xrdp sessions
+          sudo bash -c 'echo xfce4-session > /etc/skel/.xsession'
+
+          sudo systemctl enable --now xrdp
+
+      - name: Create RDP user with secure password
+        shell: bash
+        run: |
+          set -euo pipefail
+          USERNAME=rdp
+          PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 16)
+
+          if ! id -u "$USERNAME" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$USERNAME"
+          fi
+
+          echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo,"rdp" "$USERNAME" 2>/dev/null || true
+
+          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
+
+      - name: Allow RDP in firewall (ufw)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo ufw allow 3389/tcp || true
+          sudo ufw --force enable || true
+
+      - name: Install Tailscale
+        shell: bash
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+
+      - name: Bring up Tailscale and get IP
+        shell: bash
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+          HOSTNAME=gh-selfhost-kali-${{ github.run_id }}
+          sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname="$HOSTNAME" || true
+
+          TAILSCALE_IP=""
+          for i in {1..10}; do
+            sleep 3
+            TAILSCALE_IP=$(tailscale ip -4 || true)
+            if [[ -n "$TAILSCALE_IP" ]]; then
+              break
+            fi
+          done
+
+          if [[ -z "$TAILSCALE_IP" ]]; then
+            echo "Tailscale IP not assigned. Exiting." >&2
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+
+      - name: Verify RDP accessibility via Tailscale
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Tailscale IP: $TAILSCALE_IP"
+
+          if timeout 5 bash -c "</dev/tcp/$TAILSCALE_IP/3389" 2>/dev/null; then
+            echo "TCP connectivity to 3389 succeeded"
+          else
+            echo "TCP connectivity to 3389 failed" >&2
+            exit 1
+          fi
+
+      - name: Print connection info and keep runner active
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "\n=== RDP ACCESS (Kali) ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: rdp"
+          echo "Password: $(echo $RDP_CREDS | sed 's/^.*Password: //')"
+          echo "===========================\n"
+
+          while true; do
+            echo "[$(date --rfc-3339=seconds)] RDP Active - cancel workflow to terminate"
+            sleep 300
+          done
+
+# Notes:
+# - These jobs assume you have a self-hosted runner available with labels matching
+#   the `runs-on` selector (e.g. a machine labeled `debian` or `kali`). A self-hosted
+#   runner must support systemd and a GUI for xrdp to work.
+# - The workflow uses the TAILSCALE_AUTH_KEY secret; ensure it is created in your repo/org.
+# - Keep the workflow timeout reasonable (360 minutes max for long-lived sessions).
+# - Running GUI services on ephemeral GitHub-hosted containers is not supported; use
+#   self-hosted machines or cloud VMs that you manage.
