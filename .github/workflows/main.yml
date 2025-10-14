@@ -1,130 +1,9 @@
-# GitHub Actions workflow providing two variants for Linux RDP access.
-# IMPORTANT: These jobs are written for *self-hosted* Linux machines that
-# support systemd and a GUI (desktop environment). GitHub-hosted runners
-# (containers or ephemeral VMs) generally do NOT support running a full
-# desktop + systemd persistently. Use a self-hosted runner with the label
-# `debian` or `kali` as appropriate.
-
-name: RDP-Linux
+name: RDP-Kali
 
 on:
   workflow_dispatch:
 
 jobs:
-  debian-rdp:
-    name: Debian RDP (self-hosted)
-    runs-on: [self-hosted, linux, debian]
-    timeout-minutes: 360
-
-    steps:
-      - name: Prepare system and install desktop + xrdp
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          export DEBIAN_FRONTEND=noninteractive
-          # Install XFCE and xrdp (adjust packages if you prefer another DE)
-          sudo apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 ufw
-
-          # Configure xfce for xrdp sessions
-          sudo bash -c 'echo xfce4-session > /etc/skel/.xsession'
-
-          # Enable and start xrdp
-          sudo systemctl enable --now xrdp
-
-      - name: Create RDP user with secure password
-        shell: bash
-        run: |
-          set -euo pipefail
-          USERNAME=rdp
-          # Generate a 16-character password (alphanumeric + symbols)
-          PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 16)
-
-          # Create user if it doesn't exist
-          if ! id -u "$USERNAME" >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash "$USERNAME"
-          fi
-
-          echo "$USERNAME:$PASSWORD" | sudo chpasswd
-          # Give sudo and add to necessary groups
-          sudo usermod -aG sudo,"rdp" "$USERNAME" 2>/dev/null || true
-
-          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
-
-      - name: Allow RDP in firewall (ufw)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Allow only from tailscale interface will be configured later; for now allow 3389
-          sudo ufw allow 3389/tcp || true
-          sudo ufw --force enable || true
-
-      - name: Install Tailscale
-        shell: bash
-        env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          set -euo pipefail
-          # Use the official Tailscale installer script (works on Debian-family systems)
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
-
-      - name: Bring up Tailscale and get IP
-        shell: bash
-        env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          set -euo pipefail
-          HOSTNAME=gh-selfhost-debian-${{ github.run_id }}
-          sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname="$HOSTNAME" || true
-
-          # Wait for an IPv4 tailscale address
-          TAILSCALE_IP=""
-          for i in {1..10}; do
-            sleep 3
-            TAILSCALE_IP=$(tailscale ip -4 || true)
-            if [[ -n "$TAILSCALE_IP" ]]; then
-              break
-            fi
-          done
-
-          if [[ -z "$TAILSCALE_IP" ]]; then
-            echo "Tailscale IP not assigned. Exiting." >&2
-            exit 1
-          fi
-
-          # Save to environment for later steps
-          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
-
-      - name: Verify RDP accessibility via Tailscale
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Tailscale IP: $TAILSCALE_IP"
-
-          # Quick TCP test using bash /dev/tcp (no extra tools required)
-          if timeout 5 bash -c "</dev/tcp/$TAILSCALE_IP/3389" 2>/dev/null; then
-            echo "TCP connectivity to 3389 succeeded"
-          else
-            echo "TCP connectivity to 3389 failed" >&2
-            exit 1
-          fi
-
-      - name: Print connection info and keep runner active
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "\n=== RDP ACCESS (Debian) ==="
-          echo "Address: $TAILSCALE_IP"
-          echo "Username: rdp"
-          echo "Password: $(echo $RDP_CREDS | sed 's/^.*Password: //')"
-          echo "===========================\n"
-
-          # Keep job alive (will still be capped by workflow timeout)
-          while true; do
-            echo "[$(date --rfc-3339=seconds)] RDP Active - cancel workflow to terminate"
-            sleep 300
-          done
-
   kali-rdp:
     name: Kali RDP (self-hosted)
     runs-on: [self-hosted, linux, kali]
@@ -230,10 +109,6 @@ jobs:
           done
 
 # Notes:
-# - These jobs assume you have a self-hosted runner available with labels matching
-#   the `runs-on` selector (e.g. a machine labeled `debian` or `kali`). A self-hosted
-#   runner must support systemd and a GUI for xrdp to work.
-# - The workflow uses the TAILSCALE_AUTH_KEY secret; ensure it is created in your repo/org.
-# - Keep the workflow timeout reasonable (360 minutes max for long-lived sessions).
-# - Running GUI services on ephemeral GitHub-hosted containers is not supported; use
-#   self-hosted machines or cloud VMs that you manage.
+# - Requires a self-hosted Kali Linux runner with systemd and GUI support.
+# - Uses the TAILSCALE_AUTH_KEY secret for private network access.
+# - This configuration is temporary and intended for secure, limited-duration sessions.
