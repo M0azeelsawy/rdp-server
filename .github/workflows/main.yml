@@ -1,165 +1,109 @@
-name: Kali-like GUI over VNC (auto runner, Tailscale-secured)
-
-on:
+name: RDP
+on: 
   workflow_dispatch:
 
-jobs:
-  gui-vnc-tailscale:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    env:
-      # keep things consistent
-      DISPLAY_NUM: ":99"
-      VNC_PORT: 5900
-
-    steps:
-      - name: Checkout (needed for some runners/logs)
-        uses: actions/checkout@v4
-
-      - name: Install packages (XFCE, Xvfb, x11vnc, tailscale deps)
-        shell: bash
+jobs: 
+  secure-rdp: 
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    steps: 
+      - name: Configure Core RDP Settings
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          export DEBIAN_FRONTEND=noninteractive
-          # lightweight desktop + vnc + common tools
-          sudo apt-get install -y xfce4 xfce4-terminal x11vnc xvfb \
-              xauth dbus-x11 netcat-openbsd curl gnupg lsb-release
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Generate VNC password and save to env
-        id: vncpass
-        shell: bash
-        run: |
-          # 16 char password (alnum + symbols) but x11vnc/storepasswd defaults to 8, so we rely on 16 anyway
-          PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 16)
-          echo "VNC_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
-          echo "VNC_PASSWORD=${PASSWORD}"
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
 
-      - name: Install Tailscale
-        shell: bash
-        env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          set -euo pipefail
-          # Install official tailscale package (installer script handles distro)
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-      - name: Start tailscaled and tailscale up
-        shell: bash
-        env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
         run: |
-          set -x
-          # Start tailscaled in background with a state file inside /tmp
-          sudo tailscaled --tun=userspace-networking --state=/tmp/tailscaled.state /dev/null &>/tmp/tailscaled.log &
-          TAILSCALED_PID=$!
-          echo "tailscaled pid: $TAILSCALED_PID"
-          # Give it a moment to start
-          sleep 2
-          # Bring up the interface using the auth key
-          sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname="gh-runner-${GITHUB_RUN_ID}" || {
-            echo "tailscale up failed - check /tmp/tailscaled.log"
-            tail -n +1 /tmp/tailscaled.log || true
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+            Upper = [char[]](65..90)    # A-Z
+            Lower = [char[]](97..122)   # a-z
+            Number = [char[]](48..57)   # 0-9
+            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+            Write-Error "User creation failed"
             exit 1
           }
-          # Wait for an IPv4 address
-          for i in {1..12}; do
-            TS_IP=$(tailscale ip -4 || true)
-            if [[ -n "$TS_IP" ]]; then
-              echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-              echo "Found Tailscale IP: $TS_IP"
-              break
-            fi
-            sleep 2
-          done
-          if [[ -z "${TS_IP:-}" ]]; then
-            echo "No Tailscale IP assigned; tailscale status:"
-            sudo tailscale status || true
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", ""$installerPath"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned. Exiting."
             exit 1
-          fi
+          }
 
-      - name: Start virtual X display and XFCE session
-        shell: bash
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
         run: |
-          set -euo pipefail
-          echo "Starting Xvfb on display $DISPLAY_NUM"
-          # Start virtual X server
-          nohup Xvfb $DISPLAY_NUM -screen 0 1280x720x24 &>/tmp/xvfb.log &
-          XVFB_PID=$!
-          echo "Xvfb pid: $XVFB_PID"
-          export DISPLAY=$DISPLAY_NUM
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-          # ensure dbus session bus is available for xfce
-          mkdir -p /tmp/xdg-${GITHUB_RUN_ID}
-          export XDG_RUNTIME_DIR=/tmp/xdg-${GITHUB_RUN_ID}
-          sudo chown $USER:$USER $XDG_RUNTIME_DIR || true
-
-          sleep 2
-
-          # Start xfce session in background
-          echo "Starting xfce4-session (headless)"
-          nohup dbus-launch --exit-with-session startxfce4 &>/tmp/xfce.log &
-          XFCE_PID=$!
-          echo "xfce pid: $XFCE_PID"
-          # allow some time for desktop to initialize
-          sleep 5
-
-      - name: Configure x11vnc and start VNC server
-        shell: bash
-        run: |
-          set -euo pipefail
-          export DISPLAY=$DISPLAY_NUM
-          VNC_PASS_FILE=/tmp/vncpass.$GITHUB_RUN_ID
-          # create VNC password file
-          printf "%s\n" "$VNC_PASSWORD" | x11vnc -storepasswd /tmp/vncpass.$GITHUB_RUN_ID >/dev/null
-          chmod 600 $VNC_PASS_FILE || true
-          echo "Starting x11vnc (display $DISPLAY) on port $VNC_PORT, auth file: $VNC_PASS_FILE"
-          # Bind to all interfaces (we rely on Tailscale to secure access). Use -noxdamage to avoid some client issues.
-          nohup x11vnc -display $DISPLAY -rfbauth /tmp/vncpass.$GITHUB_RUN_ID -forever -shared -noxdamage -rfbport $VNC_PORT &>/tmp/x11vnc.log &
-          X11VNC_PID=$!
-          echo "x11vnc pid: $X11VNC_PID"
-          sleep 2
-          tail -n 200 /tmp/x11vnc.log || true
-
-      - name: Verify VNC port reachable from Tailscale IP
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAILSCALE_IP="${TAILSCALE_IP:-}"
-          echo "Tailscale IP: $TAILSCALE_IP"
-          if [ -z "$TAILSCALE_IP" ]; then
-            echo "No Tailscale IP present" >&2
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 failed"
             exit 1
-          fi
+          }
 
-          # simple TCP check using bash /dev/tcp (timeout)
-          if timeout 5 bash -c "cat < /dev/tcp/$TAILSCALE_IP/$VNC_PORT" 2>/dev/null; then
-            echo "Port $VNC_PORT reachable on $TAILSCALE_IP (connection accepted)"
-          else
-            echo "Port $VNC_PORT may not be open yet on $TAILSCALE_IP - verifying processes:"
-            ps aux | egrep 'x11vnc|Xvfb|tailscaled|startxfce' || true
-            tail -n 200 /tmp/x11vnc.log || true
-            exit 1
-          fi
+          Write-Host "TCP connectivity successful!"
 
-      - name: Print connection info and keep workflow active
-        shell: bash
+      - name: Maintain Connection
         run: |
-          set -euo pipefail
-          echo ""
-          echo "=== GUI ACCESS (VNC over Tailscale) ==="
-          echo "Address (Tailscale IP): ${TAILSCALE_IP}"
-          echo "VNC port: ${VNC_PORT}"
-          echo "VNC password: ${VNC_PASSWORD}"
-          echo ""
-          echo "Use a VNC client (e.g. TigerVNC, RealVNC) to connect to:"
-          echo "  ${TAILSCALE_IP}:${VNC_PORT}"
-          echo ""
-          echo "Notes: The runner will terminate when the job finishes or its timeout is reached."
-          echo "========================================"
-          # Keep job alive (still bound by workflow timeout)
-          while true; do
-            echo "[$(date --rfc-3339=seconds)] VNC session active; cancel workflow to terminate"
-            sleep 300
-          done
+          Write-Host "n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================n"
+
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+            Start-Sleep -Seconds 300
+          }
